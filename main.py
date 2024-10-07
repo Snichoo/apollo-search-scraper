@@ -1,98 +1,92 @@
 import os
-import csv
 import json
-import time
-from datetime import datetime
-
-from selenium import webdriver
-from selenium.common.exceptions import NoSuchElementException, TimeoutException
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.chrome.service import Service as ChromeService
-from selenium.webdriver.chrome.options import Options
-
+import asyncio
 from flask import Flask, request, jsonify
+from playwright.async_api import async_playwright
 
 app = Flask(__name__)
 
-# Set up the driver
-chrome_options = Options()
-chrome_options.add_argument("--headless")  # Run in headless mode
-chrome_options.add_argument("--no-sandbox")
-chrome_options.add_argument("--disable-dev-shm-usage")
-chrome_options.add_argument("--disable-gpu")
-chrome_options.add_argument("--window-size=1920,1080")
-chrome_options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)")
+# Load config data from environment variables
+config = {
+    'email': os.environ.get('APOLLO_EMAIL'),
+    'password': os.environ.get('APOLLO_PASSWORD')
+}
 
-# Initialize the driver using the system-installed chromedriver
-driver = webdriver.Chrome(service=ChromeService(), options=chrome_options)
-driver.implicitly_wait(2)
+# Singleton for Playwright instance
+playwright_instance = None
+browser = None
+context = None
+page = None
 
-# Load config data
-with open('config.json', 'r') as file:
-    config = json.load(file)
+async def init_browser():
+    global playwright_instance, browser, context, page
+    if not browser:
+        playwright_instance = await async_playwright().start()
+        browser = await playwright_instance.chromium.launch(headless=True)
+        context = await browser.new_context()
+        page = await context.new_page()
 
-def login_to_site(driver, config):
+        # Ensure we are logged in
+        await login_to_site(page)
+
+async def login_to_site(page):
     print('Starting login process...')
-    driver.get('https://app.apollo.io/#/login')
+    await page.goto('https://app.apollo.io/#/login')
 
     # Wait for the login form to be present
-    WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.NAME, "email")))
+    await page.wait_for_selector("input[name='email']")
 
-    email_field = driver.find_element(By.NAME, "email")
-    password_field = driver.find_element(By.NAME, "password")
-    email_field.send_keys(config['email'])
-    password_field.send_keys(config['password'])
-    driver.find_element(By.CSS_SELECTOR, "button[type='submit']").click()
+    await page.fill("input[name='email']", config['email'])
+    await page.fill("input[name='password']", config['password'])
+    await page.click("button[type='submit']")
 
     # Wait for the URL to change indicating successful login
     print("Waiting for login to complete...")
     try:
-        WebDriverWait(driver, 30).until(lambda d: 'apollo.io' in d.current_url and '/home' in d.current_url)
+        await page.wait_for_url('https://app.apollo.io/#/home', timeout=30000)
         print("Login successful.")
-    except TimeoutException:
+    except Exception:
         print("Login failed: timeout waiting for login to complete.")
-        driver.save_screenshot('login_timeout.png')
+        await page.screenshot(path='login_timeout.png')
         print("Saved screenshot to 'login_timeout.png'")
-        driver.quit()
+        await browser.close()
         exit(1)
 
-def reveal_and_collect_email(driver):
+async def reveal_and_collect_email(page):
     try:
         # First, try to find the email directly
         print("Attempting to find the email directly...")
-        email_element = driver.find_element(By.XPATH, "//span[contains(text(), '@')]")
-        email = email_element.text
-        print(f"Collected email directly: {email}")
-        return email
-    except NoSuchElementException:
-        print("Email not found directly. Checking for 'Access email' button...")
+        email_element = await page.query_selector("//span[contains(text(), '@')]")
+        if email_element:
+            email = await email_element.text_content()
+            print(f"Collected email directly: {email}")
+            return email
+    except Exception as e:
+        print(f"Error finding email directly: {e}")
 
     try:
         # If email is not found, look for the 'Access email' button
-        access_email_button = driver.find_element(By.XPATH, "//button[.//span[text()='Access email']]")
-        print("Found 'Access email' button, clicking...")
-        access_email_button.click()
-        print("Clicked 'Access email' button.")
+        access_email_button = await page.query_selector("//button[.//span[text()='Access email']]")
+        if access_email_button:
+            print("Found 'Access email' button, clicking...")
+            await access_email_button.click()
+            print("Clicked 'Access email' button.")
 
-        # Wait for the email to be visible after clicking the button
-        print("Waiting for email to be visible...")
-        email_element = WebDriverWait(driver, 30).until(
-            EC.visibility_of_element_located((By.XPATH, "//span[contains(text(), '@')]"))
-        )
-        email = email_element.text
-        print(f"Collected email after clicking button: {email}")
-        return email
-
-    except NoSuchElementException:
-        print("Neither email nor 'Access email' button found.")
-        driver.save_screenshot('email_not_found.png')
-        print("Saved screenshot to 'email_not_found.png'")
-        return None
+            # Wait for the email to be visible after clicking the button
+            print("Waiting for email to be visible...")
+            await page.wait_for_selector("//span[contains(text(), '@')]", timeout=30000)
+            email_element = await page.query_selector("//span[contains(text(), '@')]")
+            email = await email_element.text_content()
+            print(f"Collected email after clicking button: {email}")
+            return email
+        else:
+            print("Neither email nor 'Access email' button found.")
+            await page.screenshot(path='email_not_found.png')
+            print("Saved screenshot to 'email_not_found.png'")
+            return None
     except Exception as e:
-        print(f"An error occurred: {str(e)}")
-        driver.save_screenshot('reveal_and_collect_email_exception.png')
+        print(f"An error occurred: {e}")
+        await page.screenshot(path='reveal_and_collect_email_exception.png')
         print("Saved screenshot to 'reveal_and_collect_email_exception.png'")
         return None
 
@@ -109,38 +103,42 @@ def get_email():
     # Construct the URL
     url = f"https://app.apollo.io/#/people?sortByField=%5Bnone%5D&sortAscending=false&page=1&qPersonName={first_name}%20{last_name}&organizationIds[]={organization_id}"
 
-    # Ensure we are logged in
-    if not driver.current_url.startswith('https://app.apollo.io/'):
-        login_to_site(driver, config)
+    async def process_request():
+        await init_browser()
 
-    # Navigate to the URL
-    driver.get(url)
+        try:
+            # Navigate to the URL
+            await page.goto(url)
+            print("Waiting for page to load...")
+            await page.wait_for_selector("body")
+            print("Page loaded successfully.")
 
-    try:
-        # Wait for the page to load
-        print("Waiting for page to load...")
-        WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-        print("Page loaded successfully.")
+            # Call the function to reveal and collect the email
+            email = await reveal_and_collect_email(page)
 
-        # Call the function to reveal and collect the email
-        email = reveal_and_collect_email(driver)
+            if email:
+                return jsonify({'email': email})
+            else:
+                return jsonify({'error': 'Email not found'}), 404
+        except Exception as e:
+            print(f"An error occurred: {e}")
+            return jsonify({'error': 'Internal server error'}), 500
 
-        if email:
-            return jsonify({'email': email})
-        else:
-            return jsonify({'error': 'Email not found'}), 404
+    return asyncio.run(process_request())
 
-    except TimeoutException:
-        print("Timeout: Page did not load within the expected time.")
-        driver.save_screenshot('main_timeout_screenshot.png')
-        print("Saved screenshot to 'main_timeout_screenshot.png'")
-        return jsonify({'error': 'Timeout loading page'}), 500
-    except Exception as e:
-        print(f"An error occurred: {str(e)}")
-        driver.save_screenshot('exception_screenshot.png')
-        print("Saved screenshot to 'exception_screenshot.png'")
-        return jsonify({'error': 'Internal server error'}), 500
+@app.route('/shutdown', methods=['POST'])
+def shutdown():
+    async def close_resources():
+        global browser, playwright_instance
+        if browser:
+            await browser.close()
+            browser = None
+        if playwright_instance:
+            await playwright_instance.stop()
+            playwright_instance = None
+    asyncio.run(close_resources())
+    return jsonify({'status': 'Browser closed'}), 200
 
 if __name__ == "__main__":
-    # For Google Cloud Run, the port should be 8080
-    app.run(host='0.0.0.0', port=8080)
+    port = int(os.environ.get('PORT', 8080))
+    app.run(host='0.0.0.0', port=port)
