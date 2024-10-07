@@ -1,6 +1,5 @@
 {
     "email": "kamexa.test@gmail.com",
     "password": "Lawlibrary2113!",
-    "start_url": "https://app.apollo.io/#/people?sortByField=%5Bnone%5D&sortAscending=false&page=1&qPersonName=Waterford&organizationIds[]=56e1d526f3e5bb39d70012da",
     "export_file_name": "export_leads_name.csv"
   }
